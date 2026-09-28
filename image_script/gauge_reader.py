@@ -186,10 +186,45 @@ def _ink_mask(bgr: np.ndarray) -> np.ndarray:
     grayscale threshold merges the colored arc into the same blob as the
     real ink (the arc is dark-ish in grayscale too); using saturation as a
     second axis is what actually separates them — validated empirically
-    against real gauge photos (see gaugesdetectionplan.md)."""
+    against real gauge photos (see gaugesdetectionplan.md).
+
+    Uses a fixed brightness cutoff, so it only holds for a light-faced dial.
+    Prefer _face_ink_mask whenever the dial circle is known."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
     return ((s < _INK_SAT_THRESH) & (v < _INK_VAL_THRESH)).astype(np.uint8) * 255
+
+
+def _face_ink_mask(bgr: np.ndarray, lcx: float, lcy: float, r: float) -> tuple:
+    """Ink mask for a dial whose circle is already known, thresholded
+    *relative to that dial's own face* rather than against a fixed cutoff.
+
+    _ink_mask's fixed "darker than 140" rule silently assumes a light face.
+    On a dim photo of a dark or greyish face the entire face reads as ink —
+    measured 42.6% of the face on one real industrial gauge, against 9-28%
+    on photos that work — and Hough then returns a confident-looking angle
+    computed from what is effectively noise. Otsu within the face splits
+    whatever is actually there into its own dark and light groups, which is
+    the same relative-threshold fix that made digital_display_reader._led_mask
+    work across displays of different colors. The low-saturation constraint is
+    kept as-is; that axis is what separates ink from colored arcs and is
+    unaffected by overall brightness.
+
+    Returns (ink, face_mask) so callers can measure coverage against the face
+    rather than the whole crop."""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    face_mask = np.zeros(v.shape, np.uint8)
+    cv2.circle(face_mask, (int(lcx), int(lcy)), max(int(r * 0.95), 1), 255, -1)
+    inside = face_mask > 0
+    if not inside.any():
+        return np.zeros(v.shape, np.uint8), face_mask
+
+    threshold, _ = cv2.threshold(v[inside], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ink = np.zeros(v.shape, np.uint8)
+    ink[inside] = ((v[inside] < threshold) & (s[inside] < _INK_SAT_THRESH)).astype(np.uint8) * 255
+    return ink, face_mask
 
 
 _ENHANCE_UPSCALE = 2.0
@@ -213,12 +248,118 @@ def _enhance_roi(bgr: np.ndarray, lcx: float, lcy: float, r: float) -> tuple:
     return enhanced, lcx * up, lcy * up, r * up
 
 
+# Even with a face-relative mask, a wildly over-filled result means the dial
+# isn't separable into markings and background at all. Loose sanity net only —
+# the adaptive mask brings real photos to 10-25% of the face.
+_MAX_INK_COVERAGE_FRAC = 0.5
+
+# Radii (as fractions of dial radius) at which needle thickness is sampled.
+# Deliberately close to the hub: a counterweight is short, so sampling further
+# out measures past its end and dilutes the very difference being looked for.
+_THICKNESS_SAMPLE_RADII = (0.20, 0.28, 0.36)
+_THICKNESS_HALF_SPAN = 0.18  # how far to sweep perpendicular to the needle, as a fraction of r
+
+# The thicker side must beat the thinner one by this factor before either end is
+# trusted as the tip. Real photos measured 2.2-4.7, so 1.3 leaves clear margin
+# while still refusing to call a coin flip.
+_NEEDLE_THICKNESS_RATIO_MIN = 1.3
+
+# Below this (fraction of r), nothing needle-like is present at the sample radii
+# — e.g. a digital gauge's round housing, which has no pointer at all.
+_MIN_NEEDLE_WIDTH_FRAC = 0.02
+
+# Every angle here is measured from the detected circle's centre, so that centre
+# has to actually be the needle's pivot. HoughCircles can settle on a bezel or
+# an off-centre fit — on a real photo it landed 0.21r away from the true hub,
+# which skewed the reading by ~30 degrees while still looking plausible. Good
+# fits measured 0.02-0.08r, so this threshold separates them with margin.
+_MAX_HUB_OFFSET_FRAC = 0.12
+
+
+def _hub_offset(ink: np.ndarray, lcx: float, lcy: float, r: float) -> float | None:
+    """Distance from the detected dial centre to the nearest substantial ink
+    blob that could be the needle's pivot hub, as a fraction of r. None when no
+    such blob exists near the centre at all."""
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(ink)
+    min_area = (r * 0.04) ** 2
+    nearest = None
+    for i in range(1, count):
+        if stats[i, cv2.CC_STAT_AREA] < min_area:
+            continue
+        distance = math.hypot(centroids[i][0] - lcx, centroids[i][1] - lcy)
+        if distance < r * 0.45 and (nearest is None or distance < nearest):
+            nearest = distance
+    return nearest / r if (nearest is not None and r > 0) else None
+
+
+def _needle_width(ink: np.ndarray, lcx: float, lcy: float, r: float, angle_deg: float) -> float:
+    """Mean ink width perpendicular to the needle at several near-hub radii,
+    as a fraction of the dial radius."""
+    a = math.radians(angle_deg)
+    dx, dy = math.cos(a), math.sin(a)
+    px, py = -dy, dx  # unit vector perpendicular to the needle
+    h, w = ink.shape[:2]
+    step = max(r * 0.005, 0.5)
+    span = _THICKNESS_HALF_SPAN * r
+
+    widths = []
+    for frac in _THICKNESS_SAMPLE_RADII:
+        bx, by = lcx + frac * r * dx, lcy + frac * r * dy
+        lit = 0
+        offset = -span
+        while offset < span:
+            x, y = int(round(bx + offset * px)), int(round(by + offset * py))
+            if 0 <= x < w and 0 <= y < h and ink[y, x] > 0:
+                lit += 1
+            offset += step
+        widths.append(lit * step / r if r > 0 else 0.0)
+    return float(np.mean(widths)) if widths else 0.0
+
+
+def _pick_needle_direction(ink: np.ndarray, lcx: float, lcy: float, r: float, angle_deg: float) -> float | None:
+    """Resolve which end of the needle's line is the pointing tip, or None if
+    it can't be told confidently.
+
+    Hough finds the needle's line but not its direction, and many gauges carry
+    a short, blunt counterweight opposite the pointer — reading that end puts
+    the answer ~180 degrees out (seen on a real photo: a counterweight aimed at
+    "4" was read as 3.7 bar when the tip sat just above 0). The discriminator is
+    thickness rather than length: a pointer tapers thin while a counterweight is
+    stubby and wide, and thickness can be measured close to the hub where both
+    ends definitely exist. Length is the more obvious signal but a worse one in
+    practice — measuring outward runs into tick marks and printed numbers that
+    bridge onto the counterweight and reverse the comparison (tried, and it
+    flipped three otherwise-correct photos).
+
+    Declines rather than guessing when the two sides are too similar to call,
+    since a coin flip here produces a confidently wrong reading roughly half
+    the time."""
+    forward = _needle_width(ink, lcx, lcy, r, angle_deg)
+    reverse = _needle_width(ink, lcx, lcy, r, angle_deg + 180.0)
+
+    thicker, thinner = max(forward, reverse), min(forward, reverse)
+    if thicker < _MIN_NEEDLE_WIDTH_FRAC:
+        logger.info("No needle-like ink near the hub (max width %.3fr) — declining", thicker)
+        return None
+    if thinner <= 0.0 or thicker / thinner < _NEEDLE_THICKNESS_RATIO_MIN:
+        logger.info(
+            "Needle ends too similar to tell tip from counterweight "
+            "(widths %.3fr vs %.3fr) — declining",
+            forward, reverse,
+        )
+        return None
+
+    # The tapered (thinner) end is the pointer.
+    return angle_deg if forward < reverse else (angle_deg + 180.0) % 360.0
+
+
 def find_needle_angle(img_bgr: np.ndarray, circle: DialCircle) -> float | None:
     """Locate the needle within the dial and return its angle from center.
 
     The needle is distinguished from tick marks by having one endpoint very
     close to the dial's center (the pivot) while tick marks live near the rim
-    and never pass near center."""
+    and never pass near center. Which end of that line is the pointing tip is
+    resolved separately — see _pick_needle_direction."""
     small, scale = _resize_for_detection(img_bgr)
     cx, cy, r = circle.cx * scale, circle.cy * scale, circle.r * scale
     h, w = small.shape[:2]
@@ -230,10 +371,28 @@ def find_needle_angle(img_bgr: np.ndarray, circle: DialCircle) -> float | None:
     lcx, lcy = cx - x0, cy - y0
     roi, lcx, lcy, r = _enhance_roi(roi, lcx, lcy, r)
 
-    ink = _ink_mask(roi)
-    face_mask = np.zeros_like(ink)
-    cv2.circle(face_mask, (int(lcx), int(lcy)), max(int(r * 0.95), 1), 255, -1)
-    ink = cv2.bitwise_and(ink, face_mask)
+    ink, face_mask = _face_ink_mask(roi, lcx, lcy, r)
+
+    face_px = int(np.count_nonzero(face_mask))
+    if face_px == 0:
+        return None
+    ink_coverage = np.count_nonzero(ink) / face_px
+    if ink_coverage > _MAX_INK_COVERAGE_FRAC:
+        logger.warning(
+            "Ink mask covers %.0f%% of the dial face — not separable into markings "
+            "and background; declining",
+            ink_coverage * 100,
+        )
+        return None
+
+    hub_offset = _hub_offset(ink, lcx, lcy, r)
+    if hub_offset is None or hub_offset > _MAX_HUB_OFFSET_FRAC:
+        logger.warning(
+            "Detected dial centre doesn't line up with a pivot hub (offset %s) — the "
+            "circle fit is unreliable, so any angle from it would be too; declining",
+            "none found" if hub_offset is None else f"{hub_offset:.2f}r",
+        )
+        return None
 
     # The needle's near-center endpoint lands at the edge of the pivot hub, not
     # the exact geometric center pixel — measured ~0.2-0.35r away in practice —
@@ -266,7 +425,7 @@ def find_needle_angle(img_bgr: np.ndarray, circle: DialCircle) -> float | None:
     if not candidates:
         return None
     candidates.sort(key=lambda c: -c[0])
-    return candidates[0][1]
+    return _pick_needle_direction(ink, lcx, lcy, r, candidates[0][1])
 
 
 # Tuned for tick MARKS (short radial dashes near the rim), not tick TEXT — see
@@ -358,7 +517,7 @@ def _find_tick_mark_angles(img_bgr: np.ndarray, circle: DialCircle) -> list:
         return []
     lcx, lcy = cx - x0, cy - y0
     roi, lcx, lcy, r = _enhance_roi(roi, lcx, lcy, r)
-    ink = _ink_mask(roi)
+    ink, _ = _face_ink_mask(roi, lcx, lcy, r)
 
     best_key = None
     best_angles = []
@@ -540,7 +699,7 @@ def _debug_visualize(image_path: str, min_value: float, max_value: float) -> Non
 
     x0, y0 = max(int(circle.cx - circle.r), 0), max(int(circle.cy - circle.r), 0)
     x1, y1 = min(int(circle.cx + circle.r), img.shape[1]), min(int(circle.cy + circle.r), img.shape[0])
-    ink = _ink_mask(img[y0:y1, x0:x1])
+    ink, _ = _face_ink_mask(img[y0:y1, x0:x1], circle.cx - x0, circle.cy - y0, circle.r)
     cv2.imwrite("gauge_debug_ink_mask.png", ink)
     print("saved ink mask to gauge_debug_ink_mask.png")
 

@@ -138,15 +138,20 @@ full photo, the second is a center-cropped, zoomed-in close-up.
 
 This gauge's scale is labeled from {min_value} to {max_value}. Find the printed \
 number "{min_value}" and the printed number "{max_value}" on the dial face, and \
-report the CLOCK POSITION (nearest whole hour, 1-12, as if viewing the dial \
-like a clock face) where EACH of those two specific numbers is printed.
+report the CLOCK POSITION (1-12, as if viewing the dial like a clock face) \
+where EACH of those two specific numbers is printed.
+
+Give each position to the nearest HALF hour — use .5 when a number sits \
+between two hour marks. Gauge endpoints very often do (for example a dial \
+sweeping from lower-left to lower-right typically starts at 7.5, not 8), and \
+rounding those to a whole hour distorts the whole scale.
 
 This is a plain positional reading task — where is a printed number located — \
 not a judgment about the needle. Do not describe or estimate the needle's \
 position at all.
 
 Output ONLY: <hourMin>-<hourMax>
-e.g.: 8-4
+e.g.: 7.5-4.5
 
 If you cannot clearly judge both positions, output exactly: unknown\
 """
@@ -178,7 +183,7 @@ async def read_scale_range(image_b64: str, zoom_b64: str) -> tuple:
     return (min_value, max_value, unit)
 
 
-_ENDPOINTS_ONLY_RE = re.compile(r"^\s*(\d{1,2})\s*-\s*(\d{1,2})\s*$")
+_ENDPOINTS_ONLY_RE = re.compile(r"^\s*(\d{1,2}(?:\.\d+)?)\s*-\s*(\d{1,2}(?:\.\d+)?)\s*$")
 
 
 async def read_endpoint_positions(image_b64: str, zoom_b64: str, min_value: float, max_value: float) -> tuple:

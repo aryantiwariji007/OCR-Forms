@@ -20,29 +20,14 @@ import os
 import cv2
 import pytest
 
-from gauge_reader import read_analog_gauge
+from gauge_reader import find_dial_circle, find_needle_angle, read_analog_gauge
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 
 ANALOG_FIXTURES = [
     # (filename, min_value, max_value, expected, tolerance)
     ("gauge_analog_1.jpg", 0.0, 60.0, 10.0, 5.0),   # Parker dial, psi scale, needle near "10"
-    pytest.param(
-        "gauge_analog_2.jpg", 0.0, 4.0, 1.0, 0.3,
-        marks=pytest.mark.xfail(
-            reason=(
-                "Known gap: ROI enhancement (adaptive tick plan.md) now finds 3 "
-                "ticks on this fixture instead of 0, but the true scale has 5 "
-                "labeled ticks (0-4) — 3 detected ticks evenly split across "
-                "0-4 gives a 'nice' step (2) that passes _is_nice_step, so "
-                "gauge_reader itself returns a confidently wrong 2.07 instead "
-                "of declining. main.py's separate divergence-from-VLM check "
-                "(added after this exact case) catches it in the live "
-                "pipeline, but gauge_reader's own internal check doesn't yet."
-            ),
-            strict=False,
-        ),
-    ),
+    ("gauge_analog_2.jpg", 0.0, 4.0, 1.0, 0.3),
 ]
 
 
@@ -58,6 +43,31 @@ def test_digital_display_returns_none():
     must not fabricate an analog reading for it."""
     img = _load("gauge_digital_1.jpg")
     assert read_analog_gauge(img, min_value=0.0, max_value=100.0) is None
+
+
+def test_needle_points_at_tip_not_counterweight():
+    """The Parker dial carries a stubby counterweight opposite a long thin
+    pointer. Reading the counterweight end put an earlier version ~180 degrees
+    out, so pin the direction: the tip sits down-left toward "0" (~133 deg in
+    this module's convention, where 0 deg is 3 o'clock and angles run
+    clockwise), NOT up-right at ~313 deg."""
+    img = _load("gauge_analog_1.jpg")
+    circle = find_dial_circle(img)
+    assert circle is not None
+    angle = find_needle_angle(img, circle)
+    assert angle is not None
+    assert abs(angle - 133.0) < 15.0, f"expected tip near 133 deg, got {angle}"
+
+
+def test_declines_when_circle_centre_misses_the_hub():
+    """This fixture's dial circle fits badly — its centre lands ~0.21r from the
+    real pivot, which skewed the measured angle by roughly 30 degrees while
+    still looking plausible. Angles are only meaningful when measured from the
+    true pivot, so detection must decline rather than return that."""
+    img = _load("gauge_analog_2.jpg")
+    circle = find_dial_circle(img)
+    assert circle is not None
+    assert find_needle_angle(img, circle) is None
 
 
 @pytest.mark.parametrize("filename,min_value,max_value,expected,tolerance", ANALOG_FIXTURES)

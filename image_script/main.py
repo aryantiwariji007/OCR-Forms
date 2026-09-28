@@ -46,6 +46,37 @@ _MAX_CV_DIVERGENCE_FRAC = 0.25
 def _format_value(value: float) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
+
+# Calibrating a needle angle into a value needs two plain reading tasks — what
+# numbers are printed at the ends of the scale, and where those numbers sit.
+# Both are literal transcription rather than spatial estimation, which is the
+# kind of reading Claude has been consistently better at here (it read a
+# -1..5 bar compound scale correctly where the primary VLM reported 0..5,
+# wrongly, and the bad range made the whole calibration unusable). The primary
+# VLM remains the fallback so the pipeline still works with no Anthropic key
+# configured. Note this is the opposite of judging the needle itself, where
+# Claude was NOT more reliable — that judgement stays with our own geometry.
+async def _read_scale_range_best(image_b64: str, zoom_b64: str):
+    if settings.ANTHROPIC_API_KEY:
+        try:
+            result = await claude_vlm_client.read_scale_range(image_b64, zoom_b64)
+            if result is not None:
+                return result
+        except Exception as e:
+            logger.warning("Claude scale-range call failed, falling back: %s", e)
+    return await read_scale_range(image_b64, zoom_b64)
+
+
+async def _read_endpoints_best(image_b64: str, zoom_b64: str, min_value: float, max_value: float):
+    if settings.ANTHROPIC_API_KEY:
+        try:
+            result = await claude_vlm_client.read_endpoint_positions(image_b64, zoom_b64, min_value, max_value)
+            if result is not None:
+                return result
+        except Exception as e:
+            logger.warning("Claude endpoint-position call failed, falling back: %s", e)
+    return await read_endpoint_positions(image_b64, zoom_b64, min_value, max_value)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -182,7 +213,7 @@ async def extract_text(file: UploadFile = File(...)):
                     # we have our own reliable needle_angle to interpolate
                     # against.
                     try:
-                        scale_result = await read_scale_range(image_b64, zoom_b64)
+                        scale_result = await _read_scale_range_best(image_b64, zoom_b64)
                     except Exception as e:
                         logger.warning("Scale-range call failed: %s", e)
                         scale_result = None
@@ -201,7 +232,7 @@ async def extract_text(file: UploadFile = File(...)):
                     endpoints = None
                     if min_value is not None and max_value is not None and needle_angle is not None:
                         try:
-                            endpoints = await read_endpoint_positions(image_b64, zoom_b64, min_value, max_value)
+                            endpoints = await _read_endpoints_best(image_b64, zoom_b64, min_value, max_value)
                         except Exception as e:
                             logger.warning("Endpoint-position call failed: %s", e)
                             endpoints = None

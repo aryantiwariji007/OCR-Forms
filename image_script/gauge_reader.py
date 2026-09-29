@@ -153,6 +153,23 @@ def _resize_for_detection(img: np.ndarray, target_max_dim: int = 1000) -> tuple[
     return resized, scale
 
 
+# A candidate circle's fraction of its own radius that falls outside the photo
+# frame (0 = fully inside, 1 = a full radius' worth of overflow). A real dial
+# is normally framed whole in a close-up photo, so a spurious Hough circle
+# (an artifact of a tag plate, rivets, or bezel texture forming a rough ring)
+# is much more likely to be one that's mostly clipped by the frame edge —
+# measured across every fixture: every correctly-picked circle overflows
+# 0-9%, while wrong picks measured 44-130%.
+_MAX_CIRCLE_OVERFLOW_FRAC = 0.3
+
+
+def _circle_overflow_frac(cx: int, cy: int, r: int, w: int, h: int) -> float:
+    if r <= 0:
+        return float("inf")
+    overflow = max(0, r - cx) + max(0, (cx + r) - w) + max(0, r - cy) + max(0, (cy + r) - h)
+    return overflow / r
+
+
 def find_dial_circle(img_bgr: np.ndarray) -> DialCircle | None:
     """Locate the gauge's circular face via Hough Circle Transform."""
     small, scale = _resize_for_detection(img_bgr)
@@ -169,9 +186,22 @@ def find_dial_circle(img_bgr: np.ndarray) -> DialCircle | None:
             minRadius=int(min_dim * min_r_frac),
             maxRadius=int(min_dim * max_r_frac),
         )
-        if circles is not None:
-            cx, cy, r = max(np.round(circles[0]).astype(int), key=lambda c: c[2])
-            return DialCircle(cx / scale, cy / scale, r / scale)
+        if circles is None:
+            continue
+        rounded = np.round(circles[0]).astype(int)
+        # Among Hough's candidates, the largest radius isn't necessarily the
+        # real dial — a spurious circle elsewhere in the photo can come out
+        # larger by a narrow, essentially arbitrary margin (seen on a real
+        # photo: a false circle near a tag plate won by 12px while extending
+        # almost an entire radius past the bottom of the frame). Prefer
+        # candidates that actually fit within the photo first, then take the
+        # largest among those; fall back to the full candidate set only if
+        # none fit, so a genuinely tightly-cropped real dial still gets a
+        # result instead of nothing.
+        in_frame = [c for c in rounded if _circle_overflow_frac(*c, w, h) <= _MAX_CIRCLE_OVERFLOW_FRAC]
+        pool = in_frame if in_frame else rounded
+        cx, cy, r = max(pool, key=lambda c: c[2])
+        return DialCircle(cx / scale, cy / scale, r / scale)
     return None
 
 
@@ -227,6 +257,26 @@ def _face_ink_mask(bgr: np.ndarray, lcx: float, lcy: float, r: float) -> tuple:
     return ink, face_mask
 
 
+def _closed_for_lines(ink: np.ndarray) -> np.ndarray:
+    """A glossy/metal needle can carry a bright specular highlight down its own
+    centre — bright enough to cross the Otsu threshold and read as "not ink",
+    so the needle shows up as a thin hollow outline (just its two edges)
+    instead of one solid shape. Hough then can't trace a single line through
+    it at all and returns noise from elsewhere on the dial (seen on a real
+    photo: top candidates landed on bezel rust and label text, nowhere near
+    the actual needle). A small morphological close bridges that gap without
+    visibly changing shapes that were already solid.
+
+    Deliberately NOT folded into _face_ink_mask itself: closing can merge the
+    pivot hub with a sliver of adjacent ink unevenly, shifting its measured
+    centroid enough to look like a bad circle fit (seen on a real photo: hub
+    offset went from 0.08r to 0.17r, above the decline threshold, for a needle
+    that had nothing wrong with it). _hub_offset must keep using the raw mask;
+    only line-finding and thickness measurement need the closed one."""
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    return cv2.morphologyEx(ink, cv2.MORPH_CLOSE, kernel)
+
+
 _ENHANCE_UPSCALE = 2.0
 
 
@@ -253,19 +303,31 @@ def _enhance_roi(bgr: np.ndarray, lcx: float, lcy: float, r: float) -> tuple:
 # the adaptive mask brings real photos to 10-25% of the face.
 _MAX_INK_COVERAGE_FRAC = 0.5
 
-# Radii (as fractions of dial radius) at which needle thickness is sampled.
-# Deliberately close to the hub: a counterweight is short, so sampling further
-# out measures past its end and dilutes the very difference being looked for.
-_THICKNESS_SAMPLE_RADII = (0.20, 0.28, 0.36)
+# Radii (as fractions of dial radius) at which needle thickness is sampled, and
+# compared side-by-side at each one. Deliberately close to the hub and stopping
+# well short of the rim: a counterweight is short, so sampling too far out
+# measures past its end into background (reading as falsely "thin"); some
+# pointers also flare into an arrowhead near their own far tip, which measuring
+# too far out picks up and reads as falsely "thick". Measured across 4 real
+# needle shapes (simple wedge counterweights and a diamond-tail/arrowhead-tip
+# needle): the counterweight side was wider at every one of these radii except
+# one single-point flip on one photo, while going past 0.30r started flipping
+# on the arrowhead needle specifically. A per-radius vote (below) absorbs that
+# kind of single-point noise; a plain average across a range that runs too far
+# out cannot, because it has no way to discard the contaminated samples.
+_THICKNESS_SAMPLE_RADII = (0.10, 0.14, 0.18, 0.22, 0.26)
 _THICKNESS_HALF_SPAN = 0.18  # how far to sweep perpendicular to the needle, as a fraction of r
 
-# The thicker side must beat the thinner one by this factor before either end is
-# trusted as the tip. Real photos measured 2.2-4.7, so 1.3 leaves clear margin
-# while still refusing to call a coin flip.
-_NEEDLE_THICKNESS_RATIO_MIN = 1.3
+# Fraction of sampled radii that must agree on which side is thicker before
+# that side is trusted as the counterweight. Set well above a simple majority
+# so a couple of noisy samples can't flip the outcome.
+_NEEDLE_DIRECTION_VOTE_FRAC = 0.7
 
-# Below this (fraction of r), nothing needle-like is present at the sample radii
-# — e.g. a digital gauge's round housing, which has no pointer at all.
+# Below this (fraction of r), nothing needle-like is present at a given radius
+# — e.g. past the physical end of a short counterweight, or a digital gauge's
+# round housing with no pointer at all. A radius this thin on either side isn't
+# evidence of anything and is left out of the vote rather than counted as "the
+# thin side".
 _MIN_NEEDLE_WIDTH_FRAC = 0.02
 
 # Every angle here is measured from the detected circle's centre, so that centre
@@ -292,28 +354,25 @@ def _hub_offset(ink: np.ndarray, lcx: float, lcy: float, r: float) -> float | No
     return nearest / r if (nearest is not None and r > 0) else None
 
 
-def _needle_width(ink: np.ndarray, lcx: float, lcy: float, r: float, angle_deg: float) -> float:
-    """Mean ink width perpendicular to the needle at several near-hub radii,
-    as a fraction of the dial radius."""
+def _width_at_radius(ink: np.ndarray, lcx: float, lcy: float, r: float, angle_deg: float, frac: float) -> float:
+    """Ink width perpendicular to a ray, at one specific radius fraction, as a
+    fraction of the dial radius."""
     a = math.radians(angle_deg)
     dx, dy = math.cos(a), math.sin(a)
-    px, py = -dy, dx  # unit vector perpendicular to the needle
+    px, py = -dy, dx  # unit vector perpendicular to the ray
     h, w = ink.shape[:2]
     step = max(r * 0.005, 0.5)
     span = _THICKNESS_HALF_SPAN * r
 
-    widths = []
-    for frac in _THICKNESS_SAMPLE_RADII:
-        bx, by = lcx + frac * r * dx, lcy + frac * r * dy
-        lit = 0
-        offset = -span
-        while offset < span:
-            x, y = int(round(bx + offset * px)), int(round(by + offset * py))
-            if 0 <= x < w and 0 <= y < h and ink[y, x] > 0:
-                lit += 1
-            offset += step
-        widths.append(lit * step / r if r > 0 else 0.0)
-    return float(np.mean(widths)) if widths else 0.0
+    bx, by = lcx + frac * r * dx, lcy + frac * r * dy
+    lit = 0
+    offset = -span
+    while offset < span:
+        x, y = int(round(bx + offset * px)), int(round(by + offset * py))
+        if 0 <= x < w and 0 <= y < h and ink[y, x] > 0:
+            lit += 1
+        offset += step
+    return lit * step / r if r > 0 else 0.0
 
 
 def _pick_needle_direction(ink: np.ndarray, lcx: float, lcy: float, r: float, angle_deg: float) -> float | None:
@@ -331,26 +390,53 @@ def _pick_needle_direction(ink: np.ndarray, lcx: float, lcy: float, r: float, an
     bridge onto the counterweight and reverse the comparison (tried, and it
     flipped three otherwise-correct photos).
 
-    Declines rather than guessing when the two sides are too similar to call,
-    since a coin flip here produces a confidently wrong reading roughly half
-    the time."""
-    forward = _needle_width(ink, lcx, lcy, r, angle_deg)
-    reverse = _needle_width(ink, lcx, lcy, r, angle_deg + 180.0)
+    Compares thickness at each radius in _THICKNESS_SAMPLE_RADII separately and
+    takes a vote, rather than averaging them into one number — a single fixed
+    "the widest point" radius doesn't generalize across needle shapes (an
+    arrowhead-tipped needle's flare and a diamond-shaped counterweight's bulge
+    can sit at different distances from the hub), and averaging lets one
+    contaminated sample (e.g. a radius that's already past a short
+    counterweight's end) quietly cancel out several good ones. A vote can
+    simply discard that one bad sample instead.
 
-    thicker, thinner = max(forward, reverse), min(forward, reverse)
-    if thicker < _MIN_NEEDLE_WIDTH_FRAC:
-        logger.info("No needle-like ink near the hub (max width %.3fr) — declining", thicker)
+    Declines rather than guessing when the vote is too split to call, since a
+    coin flip here produces a confidently wrong reading roughly half the time."""
+    forward_thinner_votes = 0
+    reverse_thinner_votes = 0
+    counted = 0
+    max_width_seen = 0.0
+
+    for frac in _THICKNESS_SAMPLE_RADII:
+        forward = _width_at_radius(ink, lcx, lcy, r, angle_deg, frac)
+        reverse = _width_at_radius(ink, lcx, lcy, r, angle_deg + 180.0, frac)
+        max_width_seen = max(max_width_seen, forward, reverse)
+        if forward < _MIN_NEEDLE_WIDTH_FRAC and reverse < _MIN_NEEDLE_WIDTH_FRAC:
+            continue  # off the ink on both sides at this radius -- not informative
+        counted += 1
+        if forward < reverse:
+            forward_thinner_votes += 1
+        elif reverse < forward:
+            reverse_thinner_votes += 1
+
+    if max_width_seen < _MIN_NEEDLE_WIDTH_FRAC:
+        logger.info("No needle-like ink near the hub (max width %.3fr) — declining", max_width_seen)
         return None
-    if thinner <= 0.0 or thicker / thinner < _NEEDLE_THICKNESS_RATIO_MIN:
-        logger.info(
-            "Needle ends too similar to tell tip from counterweight "
-            "(widths %.3fr vs %.3fr) — declining",
-            forward, reverse,
-        )
+    if counted == 0:
+        logger.info("No informative radii to judge needle direction — declining")
         return None
 
     # The tapered (thinner) end is the pointer.
-    return angle_deg if forward < reverse else (angle_deg + 180.0) % 360.0
+    if forward_thinner_votes >= counted * _NEEDLE_DIRECTION_VOTE_FRAC:
+        return angle_deg
+    if reverse_thinner_votes >= counted * _NEEDLE_DIRECTION_VOTE_FRAC:
+        return (angle_deg + 180.0) % 360.0
+
+    logger.info(
+        "Needle ends too similar to tell tip from counterweight (forward thinner "
+        "at %d/%d radii, reverse thinner at %d/%d) — declining",
+        forward_thinner_votes, counted, reverse_thinner_votes, counted,
+    )
+    return None
 
 
 def find_needle_angle(img_bgr: np.ndarray, circle: DialCircle) -> float | None:
@@ -385,6 +471,10 @@ def find_needle_angle(img_bgr: np.ndarray, circle: DialCircle) -> float | None:
         )
         return None
 
+    # Hub-fit validity is checked against the RAW mask — closing (below) can
+    # merge the hub with a sliver of adjacent ink unevenly and shift its
+    # centroid, which looks exactly like a bad circle fit even when the fit is
+    # fine (see _closed_for_lines).
     hub_offset = _hub_offset(ink, lcx, lcy, r)
     if hub_offset is None or hub_offset > _MAX_HUB_OFFSET_FRAC:
         logger.warning(
@@ -393,6 +483,8 @@ def find_needle_angle(img_bgr: np.ndarray, circle: DialCircle) -> float | None:
             "none found" if hub_offset is None else f"{hub_offset:.2f}r",
         )
         return None
+
+    lines_ink = _closed_for_lines(ink)
 
     # The needle's near-center endpoint lands at the edge of the pivot hub, not
     # the exact geometric center pixel — measured ~0.2-0.35r away in practice —
@@ -403,7 +495,7 @@ def find_needle_angle(img_bgr: np.ndarray, circle: DialCircle) -> float | None:
     max_line_gap = max(int(r * 0.05), 1)
 
     lines = cv2.HoughLinesP(
-        ink, 1, np.pi / 180, threshold=30,
+        lines_ink, 1, np.pi / 180, threshold=30,
         minLineLength=min_line_length, maxLineGap=max_line_gap,
     )
     if lines is None:
@@ -425,7 +517,7 @@ def find_needle_angle(img_bgr: np.ndarray, circle: DialCircle) -> float | None:
     if not candidates:
         return None
     candidates.sort(key=lambda c: -c[0])
-    return _pick_needle_direction(ink, lcx, lcy, r, candidates[0][1])
+    return _pick_needle_direction(lines_ink, lcx, lcy, r, candidates[0][1])
 
 
 # Tuned for tick MARKS (short radial dashes near the rim), not tick TEXT — see

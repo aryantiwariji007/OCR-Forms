@@ -162,16 +162,27 @@ async def extract_text(file: UploadFile = File(...)):
         final_text = ocr_draft
         verified = False
 
-    # The model sometimes appends an explanatory paragraph after an otherwise
-    # clean reading, separated by a blank line, despite being told not to
-    # (e.g. "5.253\n\nThe image is a digital gauge, as evidenced by..."). When
-    # the content before that blank line already looks like a complete
-    # single-line gauge reading, trust only that and discard the trailing
-    # commentary — a real reading is never legitimately followed by prose.
+    # The model sometimes returns more than just the reading — an explanatory
+    # paragraph after a blank line despite being told not to
+    # ("5.253\n\nThe image is a digital gauge, as evidenced by..."), or
+    # incidental text printed on the gauge's own face transcribed as extra
+    # lines even though the prompt now says to ignore it (a tag plate, brand
+    # name, or safety warning, e.g. "0.8 kg/cm2\nPRESSURE GAUGE", or several
+    # such lines on a heavily-labeled industrial gauge). When the FIRST line
+    # alone already looks like a complete gauge reading, trust only that line
+    # and discard everything after it, regardless of how it's separated — a
+    # real reading is never legitimately followed by more prose, and text
+    # printed elsewhere on the gauge's face doesn't change what the needle is
+    # pointing at. This keeps the VLM in charge of deciding whether an image
+    # is a gauge at all (see _GAUGE_LINE_RE) — CV below only refines
+    # precision once that's already established from the model's own first
+    # line. A genuine multi-line document is virtually never a bare
+    # "<number> <unit>" line followed by more content, so this doesn't
+    # meaningfully risk truncating real text.
     if verified:
-        first_segment = final_text.strip().split("\n\n", 1)[0].strip()
-        if "\n" not in first_segment and _GAUGE_LINE_RE.match(first_segment):
-            final_text = first_segment
+        first_line = next((ln.strip() for ln in final_text.strip().splitlines() if ln.strip()), "")
+        if _GAUGE_LINE_RE.match(first_line):
+            final_text = first_line
 
     # Analog-gauge precision refinement: the VLM is unreliable at visually
     # interpolating a needle's angle (see gaugesdetectionplan.md), so when its
@@ -324,9 +335,11 @@ async def extract_text(file: UploadFile = File(...)):
                             logger.warning("Claude refinement call failed: %s", e)
                             claude_text = None
                         if claude_text:
-                            claude_lines = claude_text.strip().splitlines()
-                            if len(claude_lines) == 1 and _GAUGE_LINE_RE.match(claude_lines[0]):
-                                final_text = claude_lines[0]
+                            claude_first_line = next(
+                                (ln.strip() for ln in claude_text.strip().splitlines() if ln.strip()), ""
+                            )
+                            if _GAUGE_LINE_RE.match(claude_first_line):
+                                final_text = claude_first_line
                                 logger.info("Claude refinement applied: %s", final_text)
 
                     # None of the classical paths above (digital 7-segment decode,

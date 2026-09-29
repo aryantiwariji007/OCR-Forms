@@ -59,6 +59,41 @@ def test_needle_points_at_tip_not_counterweight():
     assert abs(angle - 133.0) < 15.0, f"expected tip near 133 deg, got {angle}"
 
 
+def test_needle_with_reflective_highlight_still_resolves():
+    """This gauge's needle is glossy enough to carry a bright specular
+    highlight down its own centre, which used to make the ink mask see only
+    the needle's two edges (a hollow outline) instead of one solid shape —
+    Hough couldn't trace a line through that at all and locked onto unrelated
+    noise (bezel rust, label text) instead. It also has an unusual needle
+    shape (a diamond-shaped counterweight opposite an arrowhead-flared tip)
+    that the original fixed-radius thickness check couldn't tell apart either
+    (both sides measured identically at 0.20-0.36r). Pin the fixed behavior:
+    tip resolves to ~302 deg (pointing toward "4000" on the scale), not ~122
+    deg (the diamond counterweight toward "0")."""
+    img = _load("gauge_analog_3_reflective_needle.jpg")
+    circle = find_dial_circle(img)
+    assert circle is not None
+    angle = find_needle_angle(img, circle)
+    assert angle is not None
+    assert abs(angle - 302.0) < 15.0, f"expected tip near 302 deg, got {angle}"
+
+
+def test_picks_the_dial_circle_over_a_larger_spurious_one():
+    """Hough found three circle candidates on this photo: the real dial, plus
+    two spurious ones from bezel/tag-plate texture — one of which was larger
+    by a narrow margin and extended almost an entire radius past the bottom of
+    the frame. Picking "largest radius" alone chose that wrong one and put the
+    circle's centre near the tag plate instead of the pivot, ~280px off (0.98r
+    of its own radius) from the true dial. Pin that the real, mostly-onscreen
+    dial wins instead."""
+    img = _load("gauge_analog_4_bad_circle_pick.jpg")
+    circle = find_dial_circle(img)
+    assert circle is not None
+    assert abs(circle.cx - 284) < 20 and abs(circle.cy - 253) < 20, (
+        f"expected centre near (284, 253), got ({circle.cx}, {circle.cy})"
+    )
+
+
 def test_declines_when_circle_centre_misses_the_hub():
     """This fixture's dial circle fits badly — its centre lands ~0.21r from the
     real pivot, which skewed the measured angle by roughly 30 degrees while

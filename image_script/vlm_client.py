@@ -87,10 +87,15 @@ geometric analysis may replace it later) and the unit shown on the gauge \
 face/display if visible (e.g. bar, psi, kg/cm2, MPa, °C, A, V, %). On a digital \
 LCD/LED readout, look carefully for a decimal point between digits (it's often \
 small and easy to miss on a photo) and include it exactly where it appears — \
-e.g. a display reading "15.000" is NOT the same as "15000". Output ONLY \
-the reading as "<value> <unit>" (e.g. "12 bar"). If multiple separate \
-gauges/readings appear, output one per line. The OCR draft cannot see needle \
-position — use it only to help confirm the unit label, never as the reading itself.
+e.g. a display reading "15.000" is NOT the same as "15000". A real gauge often \
+carries OTHER printed text that is not the reading — a manufacturer tag/serial \
+plate, brand name, model number, or a safety/usage warning stamped on the \
+face — IGNORE all of that entirely and do not transcribe any of it; it is not \
+part of the answer no matter how prominent it looks. Output ONLY the reading \
+as "<value> <unit>" (e.g. "12 bar"), nothing else on that line and no other \
+lines. If multiple separate gauges/readings appear, output one such reading \
+per line. The OCR draft cannot see needle position — use it only to help \
+confirm the unit label, never as the reading itself.
 
 2. GENERAL TEXT — a document, label, sign, or anything else where the goal is \
 transcribing the literal text present.
